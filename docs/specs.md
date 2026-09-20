@@ -6,14 +6,14 @@
 
 ## 0. Transport & code conventions (applies everywhere)
 
-- **Server Components read Cosmos directly** via `src/lib/*.ts` data
+- **Server Components read Atlas directly** via `src/lib/*.ts` data
   functions. No `fetch`, no API round-trip for page loads.
 - **Mutations use Server Actions** (`src/actions/*.ts`, `"use server"`),
   called directly from client components. No `fetch` except where noted.
 - **Route Handlers exist only for:** `/api/auth/[...all]` (Better Auth —
   OAuth requires real HTTP callbacks, cannot be an action),
   `GET`/`PUT /api/boards/[id]/scene` (multi-MB payloads + real 409/423/413
-  statuses), `/api/health` (Azure probe).
+  statuses), `/api/health` (deploy smoke check).
 - **Session in actions/components:**
   `const session = await auth.api.getSession({ headers: await headers() })`
   via `requireUser()` in `src/lib/session.ts` (throws coded error when
@@ -27,8 +27,8 @@
   a board page: `router.refresh()` from the client (manual-refresh policy —
   no polling, no WebSockets).
 - Shared data layer `src/lib/boards.ts` holds all Mongo queries so actions,
-  pages, and tests share one implementation. Single-doc writes only, no
-  transactions (Cosmos constraint).
+  pages, and tests share one implementation. Single-doc writes by design
+  (Atlas supports transactions, but nothing here needs them).
 - **Gatekeeping (cross-cutting):** board `_id`s are random strings
   (`nanoid`, 21 chars) — never ObjectIds — so URLs are unguessable;
   `authorizeBoard(boardId, userId, minRole)` in `src/lib/boards.ts` is the
@@ -53,7 +53,7 @@ message instead of a silent failure.
 - `/signin` shows two buttons; each completes OAuth and lands on `/`.
 - Allowed email on first sign-in → user created, in.
 - Non-allowed email → redirected to `/signin?error=not-invited` with the
-  explanation (asserted end-to-end in M1 against real Cosmos).
+  explanation (asserted end-to-end in M1 against the Atlas dev database).
 - Signed-in user visiting `/signin` redirects to `/`.
 
 **UI.**
@@ -64,8 +64,8 @@ message instead of a silent failure.
   callbackURL: "/" })`; renders the `not-invited` notice.
 
 **Backend.**
-- `src/lib/auth.ts`: Better Auth config — `mongodbAdapter(db,
-  { transaction: false })`, `socialProviders.google/github` (env ids +
+- `src/lib/auth.ts`: Better Auth config — `mongodbAdapter(db)` (standard
+  Atlas path, no special flags), `socialProviders.google/github` (env ids +
   secrets), 30-day sessions, `user.additionalFields.role` (`string`,
   default `"user"`, `input: false` — Better Auth has no role by default;
   the admin plugin is deliberately NOT used).
@@ -81,8 +81,8 @@ message instead of a silent failure.
   handler (mandatory Route Handler).
 - `src/lib/db.ts`: `MongoClient` singleton (dev HMR-safe global).
 - Data: `user`, `account`, `session`, `verification` (Better Auth-owned);
-  `allowedUsers` (app-owned). One-time `createdAt` indexes on the four
-  auth collections.
+  `allowedUsers` (app-owned). Recommended `createdAt` indexes on the four
+  auth collections (routine Atlas performance indexes).
 - GitHub private emails: Better Auth's github provider fetches
   `/user/emails` automatically — no extra code.
 
@@ -104,7 +104,7 @@ protected page → `/signin?next=/board/<id>`; after sign-in, return to `next`.
 **UI.** `src/app/signin/page.tsx` honors `next` param; middleware-free
 gating done per-page (server components call `requireUser()`).
 
-**Backend.** Better Auth database sessions (Cosmos `session` collection);
+**Backend.** Better Auth database sessions (Atlas `session` collection);
 `src/lib/session.ts`: `requireUser()` + `getUser()` helpers used by every
 page and action.
 
@@ -179,8 +179,8 @@ fresh `version: 1`, new ids, title + " (copy)", **no** lock and **no**
 access list: copies are always private to the duplicator),
 `deleteBoard` (owner-only guard; deletes scene doc too; succeeds even if
 another user holds the lock — the lock dies with the board). Search is
-client-side filter over the listed DTOs (small-group scale; no text
-index — Cosmos lacks them).
+client-side filter over the listed DTOs (small-group scale; Atlas text
+indexes exist but are unnecessary here).
 
 **Tests.** Full permission matrix per action (owner/editor/viewer/stranger);
 duplicate preserves scene bytes but copies neither lock nor access list;
@@ -381,24 +381,27 @@ cases — no `forbidden.tsx`, no 403 page, by gatekeeping decision);
 ## F14 — Deploy & health (ops, not a user story)
 
 **Code required.**
-- `next.config.ts`: `output: "standalone"`.
+- `netlify.toml`: Netlify build config using the official Next.js runtime
+  (no `standalone` output, no zip packaging, no startup command).
+- `.nvmrc` / `NODE_VERSION`: pins Node 22 so Netlify builds match local dev.
 - `src/app/api/health/route.ts`: returns `{ ok: true }` (no auth) —
-  deploy smoke check; set it as the App Service Health check path too,
-  knowing F1 only gets metrics/alerts from it (no instance replacement;
-  also flaky on lower tiers per operator reports — never gate deploys on it).
-- `.github/workflows/deploy.yml`: Node 22, `npm ci` → `next build` →
-  copy `public/` + `.next/static` into `.next/standalone` → zip →
-  `azure/webapps-deploy` with OIDC (no `slot-name`; F1 has none);
-  startup command `node server.js` (portal).
-- `.env.example` (§19 of plan); App Settings per plan §14.4.
+  post-deploy smoke check (open it after deploy; Netlify has no
+  App-Service-style health-check wiring and preview deploys must never
+  point at prod).
+- Deploys: Netlify Git integration auto-builds on push to `main`
+  (`npm ci` → `next build` on Netlify); no GitHub Actions deploy step.
+- `.env.example` (plan §19); environment variables set in the Netlify UI
+  per environment (prod vs preview), including `BETTER_AUTH_URL` and
+  `MONGODB_URI` / `MONGODB_DB` (Atlas; preview uses the dev/scratch
+  database, never prod).
 - OAuth registrations: Google Cloud OAuth client + GitHub OAuth App with
-  prod redirect `https://<app>.azurewebsites.net/api/auth/callback/...`
+  prod redirect `https://<site>.netlify.app/api/auth/callback/...`
   and localhost dev counterparts. **Google trap:** an External app in
   Testing mode caps at 100 users and shows an "unverified app" screen —
   either add each group member as a test user or publish to Production
   (basic profile/email scopes need no verification).
-- Standalone smoke: `node .next/standalone/server.js` locally after asset
-  copy, before every deploy.
+- Standalone smoke: `npm run build` passes locally before pushing
+  (Netlify builds on push).
 
 ## F15 — Public view link (optional, owner-controlled)
 
@@ -455,5 +458,5 @@ public viewer cannot save, lock, or list (handler-level rejections).
 | Sharing (F11) | grant/change/revoke, never-signed-in email rejected, self-revoke refusal, post-revoke blocking |
 | Public link (F15) | enable/disable/regenerate lifecycle, old/bad token 404, no edit/save/lock/list for public viewers |
 
-`mongodb-memory-server` for all DB tests; one CI smoke job against a
-scratch Cosmos database (M1 proves auth; M2+ proves app collections).
+`mongodb-memory-server` for all DB tests; one smoke job against the Atlas
+dev/scratch database (M1 proves auth; M2+ proves app collections).

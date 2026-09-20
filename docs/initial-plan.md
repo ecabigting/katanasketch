@@ -1,11 +1,12 @@
 # KatanaSketch — Initial Plan
 
-> **Status:** draft for review · **Date:** 2026-09-18
+> **Status:** draft for review · **Date:** 2026-09-18 · **Revised:** 2026-09-20 (Netlify + Atlas)
 > **Goal:** a private, invite-only "plus.excalidraw.com of our own" —
 > sign in with Google/GitHub, a workspace of persistent boards, per-user
 > view/edit sharing, and a single-editor lock (no real-time co-editing).
-> Deploy to one free-tier (F1) Azure App Service; data in the existing
-> provisioned-throughput free-tier Cosmos DB for MongoDB. Recurring cost: $0.
+> Deploy via Netlify Git-connected auto-deploys (no custom domain,
+> `*.netlify.app`); data in the existing MongoDB Atlas cluster.
+> Recurring cost: $0.
 >
 > Detail companion: `docs/specs.md` — user stories F1–F14 with UI/backend
 > per feature. Where this plan and specs differ on transport, **specs.md
@@ -27,8 +28,8 @@ Small-group whiteboarding web app ("KatanaSketch"):
 ## 2. Non-goals (explicitly out of scope)
 
 - Real-time multiplayer (cursors, live co-editing) — replaced by the lock.
-- Custom domain (F1 App Service does not support it; app lives at
-  `*.azurewebsites.net` with built-in HTTPS).
+- Custom domain (deferred; app lives at `*.netlify.app` with built-in
+  HTTPS via Netlify Git auto-deploy).
 - Open signup, teams/orgs, billing, AI features, community libraries,
   analytics/Sentry, PWA offline shell, patching the Excalidraw editor.
 
@@ -39,16 +40,21 @@ Small-group whiteboarding web app ("KatanaSketch"):
   share/collab features call backends we don't control (Firebase,
   `json.excalidraw.com`, `excalidraw-room`). It stays as **reference**;
   KatanaSketch reuses only the editor component (`@excalidraw/excalidraw`).
-- Verified Azure constraints: F1 = no custom domains, 5 concurrent
-  WebSockets (unused — we use none), 60 CPU-min/day, 1 GB RAM, sleeps on
-  idle, free HTTPS on `*.azurewebsites.net`.
-- Verified Cosmos DB free tier: lifetime 1000 RU/s + 25 GB on
-  **provisioned-throughput** accounts (confirmed: ours is provisioned).
-  Mongo API max document 16 MB.
-- Verified Better Auth ↔ Cosmos DB works with three config requirements
-  (details in §8).
-- Verified Next.js standalone → Azure App Service ZipDeploy pattern
-  (details in §14).
+- Deploy target: **Netlify Git-connected auto-deploys** (build on push,
+  no custom domain, free HTTPS on `*.netlify.app`). No server to manage,
+  no startup command, no `PORT` handling.
+- Database: existing **MongoDB Atlas cluster** (already provisioned; app
+  uses one database `katanasketch` plus a separate dev database on the
+  same cluster). Real MongoDB — multi-document transactions, `$lookup`,
+  and normal index types all work; none of the Cosmos DB for MongoDB
+  workarounds apply.
+- Better Auth ↔ MongoDB Atlas is the adapter's standard path — no special
+  flags required (no `transaction: false`, no `retrywrites=false`, no
+  mandatory `createdAt` index workaround).
+- Next.js on Netlify uses the official Netlify Next.js runtime (no
+  `standalone` output, no zip packaging).
+- License note: this repo is GPL; the editor package is MIT, which is
+  GPL-compatible to depend on. No action needed.
 - License note: this repo is GPL; the editor package is MIT, which is
   GPL-compatible to depend on. No action needed.
 
@@ -56,26 +62,26 @@ Small-group whiteboarding web app ("KatanaSketch"):
 
 | # | Decision |
 |---|---|
-| 1 | Fresh **Next.js App Router** app in this repo (`katanasketch/`). Standalone repo, npm (not pnpm — avoids hoisting issues on Azure). |
-| 2 | Auth: **Better Auth**, Google + GitHub social providers, MongoDB adapter → existing Cosmos DB. |
+| 1 | Fresh **Next.js App Router** app in this repo (`katanasketch/`). Standalone repo, npm (kept for simplicity). |
+| 2 | Auth: **Better Auth**, Google + GitHub social providers, MongoDB adapter → existing Atlas cluster. |
 | 3 | Editor: published **`@excalidraw/excalidraw` npm package** (not workspace-linked to the reference repo). |
 | 4 | No WebSockets anywhere. Locking over HTTPS + heartbeats. |
-| 5 | Single F1 Linux App Service, Next `standalone` output, GitHub Actions ZipDeploy. |
-| 6 | All app data access via the `mongodb` driver; no ODM. No multi-doc transactions anywhere. |
+| 5 | Netlify Git-connected site (auto-build on push, `*.netlify.app`), official Next.js runtime — no `standalone` output, no zip, no Actions deploy step. |
+| 6 | All app data access via the `mongodb` driver; no ODM. Single-doc writes by design (transactions available on Atlas but unused — nothing needs them). |
 
 ## 5. Architecture
 
 ```text
-Browser ──HTTPS──> [ F1 App Service: node server.js (Next standalone) ]
-                      ├─ pages (server components read Cosmos directly):
+Browser ──HTTPS──> [ Netlify: CDN + Next.js runtime (Git auto-deploy) ]
+                      ├─ pages (server components read Atlas directly):
                       │   `/`, `/board/[id]`, `/signin`
                       ├─ Server Actions (`src/actions/*`): boards CRUD,
                       │   lock, sharing, invites — called directly, no fetch
                       ├─ Route Handlers (only): `/api/auth/*` (Better Auth),
                       │   `/api/boards/[id]/scene` (large payloads + 409/423),
                       │   `/api/health`
-                      └─ mongodb driver ──> [ Cosmos DB for MongoDB ]
-                        shared-throughput DB "katanasketch":
+                      └─ mongodb driver ──> [ MongoDB Atlas (existing cluster) ]
+                        database "katanasketch" (+ separate dev database):
                           user/session/account/verification (Better Auth)
                           boards, scenes, allowedUsers
 OAuth ──> Google / GitHub (two app registrations,
@@ -100,7 +106,7 @@ katanasketch/
       share/[token]/page.tsx          # /share/:token — public read-only, no auth (F15)
       api/
         auth/[...all]/route.ts        # Better Auth handler (mandatory Route Handler)
-        health/route.ts               # liveness probe (smoke check; F1 health-check is metrics-only)
+        health/route.ts               # liveness probe (deploy smoke check)
         boards/[id]/scene/route.ts    # GET load (re-fetch), PUT save (version CAS)
     actions/
       boards.ts                       # create/rename/star/duplicate/delete + getBoardMetaAction
@@ -113,35 +119,35 @@ katanasketch/
       BoardEditor.tsx                 # "use client": mounts <Excalidraw>, lock flow, autosave
       AccessDialog.tsx                # share dialog
       LockBanner.tsx
-    lib/
-      auth.ts                         # Better Auth config (+ role field, dual invite gates)
-      db.ts                           # Cosmos MongoClient singleton (dev/prod safe)
-      session.ts                      # requireUser()/getUser()
-      boards.ts                       # board/scene/lock/access data functions + validation
-      scene.ts                        # serialize/compress/encrypt scene blobs, 16 MB guard
-      env.ts                          # validated env access (fail fast on boot)
+      lib/
+        auth.ts                         # Better Auth config (+ role field, dual invite gates)
+        db.ts                           # Atlas MongoClient singleton (dev/prod safe)
+        session.ts                      # requireUser()/getUser()
+        boards.ts                       # board/scene/lock/access data functions + validation
+        scene.ts                        # serialize/compress/encrypt scene blobs, 16 MB guard
+        env.ts                          # validated env access (fail fast on boot)
   tests/                              # vitest: unit + action/handler integration
   public/                             # static assets (fonts only if §13 fallback triggers)
   .env.example
-  next.config.ts                      # output: "standalone"
-  .github/workflows/deploy.yml
+  netlify.toml                        # Netlify build config (Next.js runtime)
+  .nvmrc                              # pins Node 22 for Netlify + local dev
 ```
 
 ## 7. Pinned stack (verified 2026-09-18, re-check at scaffold)
 
-**Version policy:** mature majors with a proven Azure track record; patch
+**Version policy:** mature majors with a proven Netlify track record; patch
 releases are stability releases and always taken; exact versions pinned in
 the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
 
 | Package | Version | Why |
 |---|---|---|
-| `next` | **^15 (latest 15.x at scaffold)** | Mature major, largest guide/answer base for Azure standalone deploys, React 19 supported since 15.0. Next 16 deliberately skipped: newer major, behavioral unknowns not yet verified. |
+| `next` | **^15 (latest 15.x at scaffold)** | Mature major, supported by the Netlify Next.js runtime, React 19 supported since 15.0. Next 16 deliberately skipped: newer major, behavioral unknowns not yet verified. |
 | `react` / `react-dom` | **^19 (exact patch pinned at scaffold)** | Editor peers require `^17 \|\| ^18 \|\| ^19`; reference repo itself runs React 19. No 19.x novelty needed — take the latest 19.x *patch*, not a new major. |
-| `node` (dev + Azure) | **22 LTS** (`NODE\|22-lts`) | Maintenance LTS with runway past 2027; every Azure standalone guide targets it. (Node 20 EOL'd 2026-04-30; Node 24 skipped per version policy.) |
+| `node` (dev + Netlify) | **22** (`.nvmrc` + `NODE_VERSION`) | Active/maintenance LTS with runway past 2027; supported by the Netlify Next.js runtime. (Node 20 EOL'd 2026-04-30; Node 24 skipped per version policy.) |
 | `@excalidraw/excalidraw` | **0.18.1** | Same minor as the reference repo (0.18.0); the `.1` is a bugfix-only patch, i.e. the stable choice, not a novelty. |
 | `better-auth` | latest v1 at scaffold | v1 is the stable major line (not beta/canary). Verify handler export shape in M1 (see §20.4) |
-| Mongo adapter | per current Better Auth docs (`better-auth/adapters/mongodb`) | `transaction: false` (see §8) |
-| `mongodb` driver | v6 | Cosmos connection string, `retrywrites=false` |
+| Mongo adapter | per current Better Auth docs (`better-auth/adapters/mongodb`) | Standard config — Atlas supports transactions, no special flags |
+| `mongodb` driver | v6 | Atlas `mongodb+srv://` connection string |
 | `pako` | latest 4.x/5.x at scaffold (mature, unchanged API for years) | Scene compression (same lib the editor uses) |
 | `nanoid` | latest 5.x at scaffold (mature, tiny) | Unguessable board IDs + public-link tokens (gatekeeping) |
 | `vitest` + `mongodb-memory-server` | latest v1/v3 at scaffold | Unit + action/handler tests without burning RU |
@@ -150,9 +156,9 @@ the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
 
 `lib/auth.ts`:
 
-- `database: mongodbAdapter(db, { transaction: false })` — Cosmos Mongo
-  API has no multi-document transactions; the adapter enables them whenever
-  a `client` is passed, so this flag is **mandatory**.
+- `database: mongodbAdapter(db)` — standard Better Auth MongoDB adapter
+  against Atlas. No `transaction: false` / `retrywrites=false` (those were
+  Cosmos-only workarounds; Atlas is real MongoDB).
 - `socialProviders: { google: {…}, github: {…} }` (built-in providers).
 - `session: { expiresIn: 30 days, updateAge: 1 day }`, cookies default
   (`httpOnly; Secure; SameSite=Lax`).
@@ -162,25 +168,27 @@ the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
   redirect to `/signin?error=not-invited`.
 - Bootstrap: `ALLOWED_EMAILS` env (owner). Admin UI on dashboard manages
   `allowedUsers` (`{ _id: lowercased email, addedBy, createdAt }`).
-- **One-time indexes** (script or portal, documented in README):
-  `createdAt` on `user`, `account`, `session`, `verification` — Cosmos
-  rejects unindexed sorts (observed failure mode for this exact adapter).
-- Leave `advanced.database.joins` off (default) — Cosmos lacks `$lookup`.
+- **Recommended indexes** (create once via script or Atlas UI, documented
+  in README): `createdAt` on `user`, `account`, `session`, `verification`
+  for session cleanup/query performance. These are routine MongoDB
+  indexes — not a Cosmos workaround.
+- `advanced.database.joins` left at its default — Atlas supports `$lookup`,
+  so no constraint either way; the app simply doesn't need joins.
 
-## 9. Data model (one shared-throughput Cosmos DB, `katanasketch`)
+## 9. Data model (Atlas database `katanasketch` + separate dev database)
 
 Better Auth owns `user`, `session`, `account`, `verification`. App owns:
 
 | Collection | Shape |
 |---|---|
 | `boards` | `{ _id: nanoid (unguessable URL id, never ObjectId), ownerId, title, createdAt, updatedAt, version, starredBy: [userId], lock?: { userId, userName, acquiredAt, expiresAt }, access: [{ userId, role: "view"\|"edit" }], publicToken?: string \| null }` — `publicToken` null = no public link (F15) |
-| `scenes` | `{ _id: boardId, version, sceneVersion, updatedAt, payload }` — AES-256-GCM blob (key from `SCENE_KEY`) of pako-compressed `{ elements, files, appState: {zoom, scroll} }`. 16 MB guard → friendly error. |
+| `scenes` | `{ _id: boardId, version, sceneVersion, updatedAt, payload }` — AES-256-GCM blob (key from `SCENE_KEY`) of pako-compressed `{ elements, files, appState: {zoom, scroll} }`. 16 MB guard (MongoDB document limit) → friendly error. |
 | `allowedUsers` | `{ _id: email, addedBy, createdAt }` |
 
-Indexes (all single-field, Cosmos-safe): `boards.ownerId`,
-`boards.access.userId`, plus §8 set. (Compound indexes exist on Cosmos but
-are unnecessary here; multi-field sorts in `findOneAndUpdate` are
-unsupported — nothing in this design needs them.)
+Indexes (normal MongoDB indexes on Atlas): `boards.ownerId`,
+`boards.access.userId`, `boards.publicToken`, plus the §8 `createdAt` set.
+Compound/text indexes are available if ever needed; the current queries
+don't require them.
 
 ## 10. Backend transport (decided: Server Actions first)
 
@@ -192,7 +200,8 @@ statuses) lives in `docs/specs.md` §0 + F1–F14 — that file is authoritative
 here. Shared rules: `requireUser()` session helper, `{ ok, data | error }`
 action results, `revalidatePath("/")` after board-list mutations,
 `router.refresh()` on board pages (manual-refresh policy, no polling, no
-WebSockets). Single-doc writes only, no transactions.
+WebSockets). Single-doc writes by design (Atlas supports transactions,
+but nothing in this design needs them).
 
 ## 11. Lock semantics
 
@@ -247,37 +256,39 @@ WebSockets). Single-doc writes only, no transactions.
   README; the reference `with-nextjs` example does the copy pre-emptively).
 - Old browser localStorage drafts from excalidraw.com are **not** migrated.
 
-## 14. Azure deployment (F1, $0)
+## 14. Netlify deployment ($0)
 
-1. App Service (Linux, F1 Free), runtime **`NODE|22-lts`**, site
-   `katanasketch…` → `https://<app>.azurewebsites.net`.
-2. `next.config.ts`: `output: "standalone"`.
-3. GitHub Actions `deploy.yml` (build on `ubuntu-latest`, Node 22):
-   `npm ci` → `next build` → `cp -r public .next/standalone/`
-   → `cp -r .next/static .next/standalone/.next/` → zip `.next/standalone`
-   → `azure/webapps-deploy` (OIDC federated credentials; **no `slot-name`**
-   — F1 has no slots). Startup command: `node server.js` (portal setting).
-4. App Settings: `SCM_DO_BUILD_DURING_DEPLOYMENT=false`,
-   `NEXT_TELEMETRY_DISABLED=1`, `NODE_ENV=production`,
-   `WEBSITE_NODE_DEFAULT_VERSION="~22"` + §8 secrets (`BETTER_AUTH_SECRET`,
-   `BETTER_AUTH_URL=https://<app>.azurewebsites.net`, `GOOGLE_*`,
-   `GITHUB_*`, `MONGODB_URI`, `SCENE_KEY`, `ALLOWED_EMAILS`).
-5. HTTPS-only ON, minimum TLS 1.2. Do NOT override `PORT` (standalone
-   server respects Azure's automatically).
+1. Netlify site connected to this repo (Git auto-deploy on push to
+   `main`), site `katanasketch…` → `https://<site>.netlify.app`.
+2. `netlify.toml`: build command `npm ci && npm run build`, publish
+   `.next`, Next.js runtime (official Netlify plugin/runtime — no
+   `standalone` output, no zip packaging, no startup command).
+3. Node version pinned via `.nvmrc` (Node 22) / `NODE_VERSION` env so
+   Netlify builds with the same major as local dev.
+4. Environment variables set in the Netlify UI (all server-side; no
+   `NEXT_PUBLIC_*`): `BETTER_AUTH_SECRET`,
+   `BETTER_AUTH_URL=https://<site>.netlify.app`, `GOOGLE_*`,
+   `GITHUB_*`, `MONGODB_URI` (Atlas `mongodb+srv://…`), `MONGODB_DB`
+   (e.g. `katanasketch`), `SCENE_KEY`, `ALLOWED_EMAILS`, plus
+   `NEXT_TELEMETRY_DISABLED=1`. Preview deploys share the dev database
+   or a scratch database — never prod.
+5. HTTPS is built-in on `*.netlify.app`. No `PORT` handling, no
+   slots/health-check wiring — `/api/health` is a deploy smoke check
+   only (open it after deploy, expect `{ ok: true }`).
 6. OAuth registrations: Google Cloud OAuth client + GitHub OAuth App with
-   prod redirect `https://<app>.azurewebsites.net/api/auth/callback/...`
+   prod redirect `https://<site>.netlify.app/api/auth/callback/...`
    and localhost dev counterparts.
-7. Accepted F1 caveats: cold starts after idle, 60 CPU-min/day (builds run
-   on GitHub, not on the app).
+7. Accepted free-tier caveats: serverless/function cold starts after
+   idle, Netlify free execution limits (fine for a small group).
 
 ## 15. Local development
 
-`npm run dev` (Next, :3000) against a **separate dev database** in the same
-free-tier Cosmos account (shared RU; usage is tiny) or
+`npm run dev` (Next, :3000) against a **separate dev database on the same
+Atlas cluster** (`MONGODB_DB` e.g. `katanasketch-dev`; usage is tiny) or
 `mongodb-memory-server` for unit tests. `.env.local` (gitignored) mirrors
 `.env.example`. Dev OAuth apps use `http://localhost:3000` callbacks.
-Pre-deployment check: `node .next/standalone/server.js` locally after
-copying static assets (§14.3).
+Pre-deployment check: `npm run build` passes locally before pushing
+(Netlify builds on push).
 
 ## 16. Testing & verification
 
@@ -285,16 +296,16 @@ copying static assets (§14.3).
   lock acquire/contend/expire/heartbeat/force-release (+ same-user
   re-acquire), scene CAS 409 + merge path, 16 MB guard, session issuance
   with mocked providers. Full matrix in `docs/specs.md`.
-- **DB in tests:** `mongodb-memory-server` (zero RU burn); one CI smoke run
-  against a scratch Cosmos database.
+- **DB in tests:** `mongodb-memory-server` (no Atlas burn); one smoke run
+  against the Atlas dev/scratch database.
 - **Gates (no "done" without green):** `tsc --noEmit`, `eslint`,
-  `vitest run`, `next build`, standalone smoke, deploy.
+  `vitest run`, `next build`, Netlify preview deploy.
 
 ## 17. Milestones & exit criteria
 
 - **M1 — Webapp + auth + deploy:** Next scaffold, Better Auth (Google+
-  GitHub) vs real Cosmos, allow-list hook + sign-in page, empty dashboard,
-  standalone build, Actions → F1, health check. **Exit:** sign in on the
+  GitHub) vs Atlas dev database, allow-list hook + sign-in page, empty dashboard,
+  Netlify Git auto-deploy, health check. **Exit:** sign in on the
   live URL; dashboard loads; sessions survive restarts. *(Proves the two
   riskiest integrations first.)*
 - **M2 — Boards actions + scene endpoints + dashboard:** CRUD/duplicate/
@@ -311,24 +322,29 @@ copying static assets (§14.3).
 
 | Risk | Mitigation |
 |---|---|
-| Better Auth↔Cosmos quirks beyond the three known flags | M1 proves it against real Cosmos; adapter `debugLogs`; fallback: hand-rolled session table (§9 already shaped for it) |
+| Better Auth↔Atlas quirks | M1 proves it against the Atlas dev database; adapter `debugLogs`; fallback: hand-rolled session table (§9 already shaped for it) |
 | Rejected-OAuth UX differs by Better Auth version | M1 spike asserts the `?error=not-invited` path end-to-end |
-| Next standalone cold start / 1 GB F1 | Small group; ~50 MB artifact; accept occasional cold start |
+| Netlify function cold start / execution limits | Small group; accept occasional cold start; autosave debounce + retry covers transient slowness |
 | Lock TTL race → conflicting saves | Version CAS + reconcile merge; 8-min TTL + 60-s heartbeat |
-| Scene + images > 16 MB | Client estimate + server guard + clear error; editor downscales pasted images |
+| Scene + images > 16 MB (MongoDB doc limit) | Client estimate + server guard + clear error; editor downscales pasted images |
 | React 19 + Next 15 + editor CSS edge cases | Pinned mature versions; visual smoke test in M3 |
-| F1 60 CPU-min/day | Builds on GitHub Actions; app serves traffic only |
-| pnpm/Azure friction | Using npm — sidesteps hoisting issues entirely |
+| Atlas free/cluster limits | Small group, tiny usage; dev + prod separated by database on the same (existing) cluster |
+| pnpm friction | Using npm — sidesteps hoisting issues entirely |
 
 ## 19. Environment variables
 
 `.env.example` documents: `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`,
 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
-`GITHUB_CLIENT_SECRET`, `MONGODB_URI` (Cosmos; includes
-`retrywrites=false`), `SCENE_KEY` (32-byte, generated), `ALLOWED_EMAILS`.
+`GITHUB_CLIENT_SECRET`, `MONGODB_URI` (Atlas `mongodb+srv://…`),
+`MONGODB_DB` (`katanasketch`, dev uses a separate name), `SCENE_KEY`
+(32-byte, generated), `ALLOWED_EMAILS`.
 No `VITE_APP_*` anywhere.
 
 ## 20. Verification log (line-by-line check, 2026-09-18)
+
+> Historical record from the Azure/Cosmos design. Items mentioning Azure,
+> standalone/ZipDeploy, or Cosmos workarounds are **superseded by §21**
+> (2026-09-20 Netlify + Atlas revision) and kept here for audit trail only.
 
 Each load-bearing claim was checked before writing. Issues found are
 marked **[ISSUE]** with their resolution.
@@ -394,3 +410,37 @@ marked **[ISSUE]** with their resolution.
     surface; the conservative set is fully covered by the guides checked in
     items 2–3 above. Patch releases are always taken; exact versions pinned
     via lockfile at scaffold.
+
+## 21. Revision log — Netlify + Atlas (2026-09-20)
+
+Supersedes all Azure/Cosmos items in §20. Decisions from deploy-strategy
+review: Netlify Git auto-deploy with no custom domain, existing Atlas
+cluster, Atlas dev database for local/dev, keep Next 15 + Netlify Next.js
+runtime (no `standalone`, no zip, no Actions deploy).
+
+1. Next.js on Netlify — official Netlify Next.js runtime supports Next 15;
+   no `output: "standalone"`, no `public/` + `.next/static` copy step, no
+   `server.js` startup command, no `PORT` handling. Build config lives in
+   `netlify.toml` + `.nvmrc` (Node 22). **In plan (§4.5, §14).**
+2. Node version — Node 22 pinned via `.nvmrc` / `NODE_VERSION` so Netlify
+   builds match local dev. Node 20 EOL rationale from §20 carries over;
+   Node 24 still skipped per stability policy. **In plan (§7, §14.3).**
+3. Better Auth ↔ Atlas — standard `mongodbAdapter(db)` path, no
+   `transaction: false`, no `retrywrites=false`. Transactions and
+   `$lookup` work on Atlas; the app keeps single-doc writes by design
+   (simplicity), not by constraint. **In plan (§3–§4, §8).**
+4. Indexes — `createdAt` on auth collections is a routine performance
+   index on Atlas, not a Cosmos unindexed-sort workaround. Compound/text
+   indexes available if needed; current queries need single-field only
+   (`boards.ownerId`, `boards.access.userId`, `boards.publicToken`).
+   **In plan (§8–§9).**
+5. 16 MB guard stays — it is the MongoDB document limit, not a
+   Cosmos quirk. **In plan (§9) and specs (F9).**
+6. Health check — `/api/health` is a post-deploy smoke check only
+   (open it, expect `{ ok: true }`); Netlify has no App-Service-style
+   health-check path wiring and preview deploys must never point at
+   prod. **In plan (§14.5) and specs (F14).**
+7. OAuth callbacks — prod redirect
+   `https://<site>.netlify.app/api/auth/callback/...` plus localhost dev
+   counterparts; `BETTER_AUTH_URL` set in the Netlify UI per environment.
+   **In plan (§14.6–§14.7).**
