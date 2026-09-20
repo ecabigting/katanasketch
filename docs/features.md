@@ -1,14 +1,15 @@
 # KatanaSketch — Detailed Features & User Stories
 
-> **Status:** draft · **Date:** 2026-09-20
-> **Relation to other docs:** `docs/specs.md` (F1–F15) is authoritative on
-> transport and code split; `docs/initial-plan.md` is authoritative on
-> architecture and deploy (Netlify Git auto-deploy + existing MongoDB Atlas
-> cluster). This file expands the same F1–F15 into detailed, layered user
-> stories for **both** audiences: plain-language narrative up top,
-> builder notes (UI / Backend / Edge cases / Tests) below.
+> **Status:** draft · **Date:** 2026-09-20 · **Revised:** open signup (no invite-only)
+> **Relation to other docs:** `docs/specs.md` (F1–F15, F12 removed) is
+> authoritative on transport and code split; `docs/initial-plan.md` is
+> authoritative on architecture and deploy (Netlify Git auto-deploy +
+> existing MongoDB Atlas cluster). This file expands the same features into
+> detailed, layered user stories for **both** audiences: plain-language
+> narrative up top, builder notes (UI / Backend / Edge cases / Tests) below.
 > No new scope is introduced here — anything not traceable to F1–F15 is
-> marked as such.
+> marked as such. Open signup: anyone with Google/GitHub can register; no
+> allow-list, no admin role.
 
 ## How to read this file
 
@@ -38,7 +39,7 @@ Each feature has:
 | Milestone | Features |
 |---|---|
 | **M1** — app + auth + deploy | F1, F2, F14 (+ thin F3 shell: empty dashboard) |
-| **M2** — boards + dashboard | F3, F4, F5, F12 |
+| **M2** — boards + dashboard | F3, F4, F5 |
 | **M3** — editor + save + lock | F6, F7, F8, F9, F10, F13 (board paths) |
 | **M4** — sharing + hardening | F11, F15, F13 (full pass) |
 
@@ -48,7 +49,7 @@ Each feature has:
   Server Actions; Route Handlers exist only for `/api/auth/[...all]`,
   `GET`/`PUT /api/boards/[id]/scene`, `/api/health`.
 - Action results: `{ ok: true, data } | { ok: false, error: { code, message } }`
-  with codes `UNAUTHENTICATED, INVITE_REQUIRED, FORBIDDEN, NOT_FOUND, LOCKED,
+  with codes `UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, LOCKED,
   CONFLICT, TOO_LARGE, VALIDATION`.
 - Gatekeeping: board ids are unguessable `nanoid` strings;
   `authorizeBoard(boardId, userId, minRole)` is the single enforcement point;
@@ -59,43 +60,41 @@ Each feature has:
 
 ---
 
-## F1 — Sign in with Google / GitHub (invite-only)
+## F1 — Sign in with Google / GitHub (open signup)
 
-**Overview.** Only invited people can get in. A visitor picks Google or
-GitHub, approves OAuth, and either lands in their workspace or sees a clear
-"ask an admin for an invite" message. No passwords, no open signup.
+**Overview.** Anyone can get in. A visitor picks Google or GitHub, approves
+OAuth, and lands in their workspace — first sign-in creates the account
+automatically. No passwords, no invites.
 
 **Priority:** Must · **Milestone:** M1
 
-### F1.1 — Allowed user signs in with Google
+### F1.1 — Any user signs in with Google
 
-- *Story.* As an invited user with Gmail, I want to sign in with Google so
+- *Story.* As a visitor with Gmail, I want to sign in with Google so
   that I reach my workspace without a password.
 - *Acceptance.*
   - `/signin` shows a Google button; completing OAuth lands on `/`
     (or `?next=` target when present).
-  - First sign-in with an allow-listed email creates the user row with
-    `role: "user"` (or `"admin"` for bootstrap `ALLOWED_EMAILS`).
+  - First sign-in creates the user row automatically; repeat sign-ins reuse it.
   - Signed-in user visiting `/signin` redirects to `/`.
+  - Asserted end-to-end in M1 against the Atlas dev database.
 - *UI (builders).* `src/app/signin/page.tsx` (server: session check +
-  redirect, renders `SignInButtons` with `error`/`next` params);
+  redirect, renders `SignInButtons` with `next` param);
   `SignInButtons.tsx` (client: `authClient.signIn.social({ provider:
   "google", callbackURL })`).
 - *Backend (builders).* `lib/auth.ts`: `mongodbAdapter(db)` (standard Atlas
-  path), `socialProviders.google` (env id/secret), 30-day sessions;
-  `databaseHooks.user.create.before` allows iff email ∈ `allowedUsers` or
-  `ALLOWED_EMAILS`, else `false`; sets role accordingly.
+  path), `socialProviders.google` (env id/secret), 30-day sessions. No
+  `databaseHooks` gates, no `role` field, no admin plugin.
   `GET`/`POST /api/auth/[...all]` (mandatory Route Handler).
 - *Edge cases.* Google account with hidden primary email still resolves;
   double-click doesn't create two users; OAuth cancel returns to `/signin`
   without a crash.
-- *Tests.* User hook allows listed email (role `user`); bootstrap email gets
-  role `admin`; non-listed rejected; `getSession` round-trip with mocked
-  provider.
+- *Tests.* First sign-in creates a user for any Google account; repeat
+  sign-in reuses the row; `getSession` round-trip with mocked provider.
 
-### F1.2 — Allowed user signs in with GitHub
+### F1.2 — Any user signs in with GitHub
 
-- *Story.* As an invited developer, I want to sign in with GitHub so that I
+- *Story.* As a visitor with GitHub, I want to sign in with GitHub so that I
   don't need a Google account.
 - *Acceptance.* Same as F1.1 via the GitHub button, including private-email
   accounts.
@@ -103,29 +102,10 @@ GitHub, approves OAuth, and either lands in their workspace or sees a clear
 - *Backend (builders).* `socialProviders.github`; Better Auth fetches
   `/user/emails` automatically — no extra code.
 - *Edge cases.* GitHub private email (no public email) still yields the
-  verified primary address; mismatched OAuth email vs allow-list casing
-  compares case-insensitively (emails stored lowercased).
-- *Tests.* GitHub provider path with private-email fixture resolves correctly.
-
-### F1.3 — Non-invited visitor gets a clear rejection
-
-- *Story.* As a non-invited visitor, I want a plain explanation ("ask an
-  admin for an invite") instead of a silent failure or stack trace.
-- *Acceptance.*
-  - OAuth completes but user creation is refused → redirect to
-    `/signin?error=not-invited` with the explanation rendered.
-  - No session is issued; no user row usable for access.
-  - Asserted end-to-end in M1 against the Atlas dev database.
-- *UI (builders).* `SignInButtons.tsx` renders the `not-invited` notice when
-  the `error` param is present.
-- *Backend (builders).* `databaseHooks.user.create.before → false` aborts
-  creation; `databaseHooks.session.create.before → false` covers the
-  removed-email case (user row persists but no new session).
-- *Edge cases.* Rejected user retries after being allow-listed → next sign-in
-  succeeds without manual cleanup; directly visiting `/` while rejected
-  still redirects to `/signin`.
-- *Tests.* User hook rejects strangers; session hook rejects removed emails
-  despite surviving user row.
+  verified primary address; emails compared case-insensitively (stored
+  lowercased).
+- *Tests.* GitHub provider path with private-email fixture resolves correctly;
+  repeat sign-in reuses the row.
 
 ---
 
@@ -147,7 +127,7 @@ finally expires, you go back to sign-in and return to the board you were on.
 - *Backend (builders).* Better Auth database sessions in the Atlas `session`
   collection; `lib/session.ts` exposes `requireUser()` (throws coded
   `UNAUTHENTICATED`) + `getUser()`.
-- *Edge cases.* Cookie present but session row deleted (admin cleanup) →
+- *Edge cases.* Cookie present but session row deleted (e.g. manual DB cleanup) →
   treated as signed-out, redirect to `/signin`.
 - *Tests.* `requireUser` throws `UNAUTHENTICATED` without a cookie; valid
   cookie returns the user.
@@ -376,7 +356,7 @@ extend it.
 - *Backend (builders).* `actions/lock.ts acquireLock(boardId)`: CAS — set
   lock if none/expired, succeed silently if holder is already me. Lock shape
   `{ userId, userName, acquiredAt, expiresAt }`, TTL 8 min. Stale purge also
-  runs in the `getBoardMeta` read path (crashed tabs need no admin).
+  runs in the `getBoardMeta` read path (crashed tabs need no manual action).
 - *Edge cases.* Two tabs racing: both end "Editing" for the same user, one
   TTL; acquire with no access → `FORBIDDEN`/`NOT_FOUND`, never `LOCKED`.
 - *Tests.* Acquire/contend/expire; same-user re-acquire succeeds and extends;
@@ -401,9 +381,8 @@ extend it.
 - *Story.* As the holder, I want the lock released when I leave; as an
   owner, I want to free a stuck lock so that work isn't blocked.
 - *Acceptance.* Tab close/hide releases best-effort (`beforeunload` /
-  `visibilitychange`, fire-and-forget); `forceReleaseLock` works for the
-  owner, or an admin **with access to that board** (least privilege — an
-  admin who can't see the board can't touch its lock); others rejected.
+  `visibilitychange`, fire-and-forget); `forceReleaseLock` is owner-only;
+  others rejected.
 - *UI (builders).* Release hooks in `BoardEditor.tsx`; Force-release button
   for eligible users (also surfaced in `LockBanner`, F8).
 - *Backend (builders).* `releaseLock` (holder only); `forceReleaseLock`
@@ -411,8 +390,8 @@ extend it.
 - *Edge cases.* Release for an already-expired lock succeeds silently;
   force-release while holder is mid-save → holder's next save gets 423 and
   must re-acquire.
-- *Tests.* Release/force matrix: owner frees stranger lock; admin with access
-  frees; admin without access rejected; non-owner rejected.
+- *Tests.* Release/force matrix: owner frees stranger lock; non-owner
+  (including editors/viewers) rejected.
 
 ---
 
@@ -439,7 +418,7 @@ their name, a Retry button, and (for owners) a force-release.
 - *Edge cases.* Lock frees between render and Retry → Edit appears without a
   full reload; holder name missing → generic "someone else" label.
 - *Tests.* Read-only prop set when locked; Retry transitions on freed lock;
-  force-release visibility restricted to owner/admin-with-access.
+  force-release visibility restricted to owner.
 
 ---
 
@@ -513,18 +492,18 @@ at least once.
 
 - *Story.* As an owner, I want to share a board with a named person as
   viewer or editor so that collaboration stays controlled.
-- *Acceptance.* Email must be allow-listed (else validation error) **and**
-  must have signed in at least once (a `user` row must exist, else "X hasn't
-  signed in yet" — access is granted by userId).
+- *Acceptance.* Email must belong to a registered user — must have signed
+  in at least once (a `user` row must exist, else "X hasn't signed in yet"
+  — access is granted by userId, and there is nothing to grant to a stranger).
 - *UI (builders).* `AccessDialog.tsx` (dashboard row or editor menu): user
   list with roles, add-by-email + role picker, errors inline.
 - *Backend (builders).* `actions/access.ts setAccess(boardId, { email, role })`
-  (owner/admin only; resolves email → userId; upserts `access` entry).
+  (owner only; resolves email → userId; upserts `access` entry).
 - *Edge cases.* Case-variant emails resolve to the same user; granting the
   owner's own email is a no-op; granting while the board is locked doesn't
   disturb the lock.
-- *Tests.* Grant matrix per role; non-allow-listed rejected; never-signed-in
-  rejected; stranger granter rejected.
+- *Tests.* Grant matrix per role; never-signed-in email rejected; stranger
+  granter rejected.
 
 ### F11.2 — Change roles and revoke access
 
@@ -546,33 +525,12 @@ at least once.
 
 ---
 
-## F12 — Admin: allow-list management ("invites")
+## F12 — Removed (allow-list admin; open signup has no admin)
 
-**Overview.** Admins control exactly who can ever sign in. Adding is
-auto-approve on first sign-in; removing blocks the next sign-in immediately.
-
-**Priority:** Must · **Milestone:** M2
-
-### F12.1 — Add and remove allowed emails
-
-- *Story.* As the admin, I want to add/remove allowed emails so that exactly
-  the right people can sign in.
-- *Acceptance.* Admin dashboard section lists emails with add/remove;
-  removed email can't sign in again — blocked at the session-creation gate
-  (F1) while already-issued sessions expire naturally; non-admins never see
-  the section (enforced server-side too).
-- *UI (builders).* Dashboard admin section iff `role == "admin"` (custom
-  field from F1, read from the session's user): add-email input, remove
-  buttons; calls invite actions.
-- *Backend (builders).* `actions/invites.ts`: `listAllowedEmails`,
-  `addAllowedEmail`, `removeAllowedEmail` (all assert `role == "admin"`).
-  Bootstrap admin comes from the F1 `create.before` hook (email ∈
-  `ALLOWED_EMAILS` → `role: "admin"`); behavior asserted end-to-end in M1.
-- *Edge cases.* Removing your own admin email doesn't demote the live session
-  but blocks the next login (documented footgun — keep a second admin);
-  duplicate add is idempotent.
-- *Tests.* Admin-only enforcement; add/remove round-trip; removed email fails
-  the session hook despite surviving user row.
+> Deleted 2026-09-20 with the invite-only model. Open signup needs no
+> allow-list, no `ALLOWED_EMAILS`, no `admin` role, and no
+> `src/actions/invites.ts`. F-number kept as a tombstone so F13–F15
+> references stay stable.
 
 ---
 
@@ -622,7 +580,7 @@ proves it.
   preview deploys must never point at prod.
 - Netlify Git integration auto-builds `main` (`npm ci` → `next build`);
   env vars (`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GOOGLE_*`,
-  `GITHUB_*`, `MONGODB_URI`, `MONGODB_DB`, `SCENE_KEY`, `ALLOWED_EMAILS`)
+  `GITHUB_*`, `MONGODB_URI`, `MONGODB_DB`, `SCENE_KEY`)
   set in the Netlify UI per environment.
 - OAuth callbacks: `https://<site>.netlify.app/api/auth/callback/...` +
   localhost counterparts. Google Testing-mode trap (100 users / unverified
@@ -701,9 +659,9 @@ just aspirational.
 - *Acceptance.*
   - Board ids and public tokens are `nanoid` 21+ chars; missing ≡ forbidden
     (uniform 404) everywhere including `/share/*`.
-  - Every page/action/handler calls `authorizeBoard` first; admins obey the
-    same board checks (admin unlocks only allow-list UI + force-release on
-    boards they can access).
+  - Every page/action/handler calls `authorizeBoard` first; there is no
+    admin role and no privilege escalation path — `forceReleaseLock` is
+    owner-only.
   - Scenes stored AES-256-GCM (`SCENE_KEY` 32-byte); tampered payload fails
     closed; secrets server-side only (no `NEXT_PUBLIC_*`).
   - Public pages expose no user data, no board list, no save/lock paths.
@@ -755,7 +713,7 @@ just aspirational.
 
 | Feature | Priority | Milestone | Stories |
 |---|---|---|---|
-| F1 sign-in (invite-only) | Must | M1 | F1.1–F1.3 |
+| F1 sign-in (open signup) | Must | M1 | F1.1–F1.2 |
 | F2 sessions & gating | Must | M1 | F2.1–F2.2 |
 | F3 dashboard view | Must | M2 (shell M1) | F3.1–F3.2 |
 | F4 create board | Must | M2 | F4.1 |
@@ -766,7 +724,7 @@ just aspirational.
 | F9 autosave | Must | M3 | F9.1 |
 | F10 conflict merge | Should | M3 | F10.1 |
 | F11 sharing | Must | M4 | F11.1–F11.2 |
-| F12 allow-list admin | Must | M2 | F12.1 |
+| F12 (removed — allow-list admin) | — | — | tombstone, no stories |
 | F13 errors & edges | Must | M3→M4 | F13.1–F13.2 |
 | F14 deploy & health | Must | M1→all | ops checklist |
 | F15 public link | Could | M4 | F15.1 |

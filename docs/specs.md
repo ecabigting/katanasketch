@@ -21,7 +21,7 @@
   "UNAUTHENTICATED" } }`).
 - **Action result shape (all actions):**
   `{ ok: true, data } | { ok: false, error: { code, message } }`.
-  Codes: `UNAUTHENTICATED, INVITE_REQUIRED, FORBIDDEN, NOT_FOUND, LOCKED,
+  Codes: `UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, LOCKED,
   CONFLICT, TOO_LARGE, VALIDATION`.
 - After board-list mutations: `revalidatePath("/")`. After lock changes on
   a board page: `router.refresh()` from the client (manual-refresh policy —
@@ -36,61 +36,49 @@
   first; authenticated-but-unauthorized access renders `notFound()`
   (uniform 404 — missing and forbidden are indistinguishable);
   unauthenticated access still redirects to `/signin` (authentication ≠
-  authorization). Admins are subject to the same checks (least privilege);
-  the `admin` role only unlocks the allow-list UI (F12) plus force-release
-  on boards they can already access (F7).
+  authorization). There is no admin role — `forceReleaseLock` (F7) is
+  owner-only.
 
 ---
 
-## F1 — Sign in with Google / GitHub (invite-only)
+## F1 — Sign in with Google / GitHub (open signup)
 
-**Story.** As a visitor with an allowed email, I want to sign in with my
-Google or GitHub account so that I reach my workspace; as a visitor
-without an allowed email, I want a clear "ask an admin for an invite"
-message instead of a silent failure.
+**Story.** As any visitor, I want to sign in with my Google or GitHub
+account so that an account is created on first sign-in and I land in my
+workspace immediately — no invite needed.
 
 **Acceptance.**
-- `/signin` shows two buttons; each completes OAuth and lands on `/`.
-- Allowed email on first sign-in → user created, in.
-- Non-allowed email → redirected to `/signin?error=not-invited` with the
-  explanation (asserted end-to-end in M1 against the Atlas dev database).
+- `/signin` shows two buttons; each completes OAuth and lands on `/`
+  (or the `?next=` target when present).
+- First sign-in with any Google/GitHub account → user created, in.
 - Signed-in user visiting `/signin` redirects to `/`.
+- Sign up and sign in are the same flow (asserted end-to-end in M1 against
+  the Atlas dev database).
 
 **UI.**
 - `src/app/signin/page.tsx` (server): checks session, redirects if present,
-  renders `SignInButtons` with `error` search param.
+  renders `SignInButtons` with `next` search param.
 - `src/components/SignInButtons.tsx` (client): two buttons calling
   `authClient.signIn.social({ provider: "google" | "github",
-  callbackURL: "/" })`; renders the `not-invited` notice.
+  callbackURL: "/" })`.
 
 **Backend.**
 - `src/lib/auth.ts`: Better Auth config — `mongodbAdapter(db)` (standard
   Atlas path, no special flags), `socialProviders.google/github` (env ids +
-  secrets), 30-day sessions, `user.additionalFields.role` (`string`,
-  default `"user"`, `input: false` — Better Auth has no role by default;
-  the admin plugin is deliberately NOT used).
-- Invite gate (two hooks, both required):
-  - `databaseHooks.user.create.before`: allow iff `email ∈ allowedUsers`
-    (DB) or `∈ ALLOWED_EMAILS`; else `false`. Sets `role: "admin"` when
-    email `∈ ALLOWED_EMAILS` (bootstrap owner), else `"user"`.
-  - `databaseHooks.session.create.before`: reject (`false`) when the
-    user's email is in neither set. This hook — not the user hook — is
-    what makes removal effective: user rows persist, so gating creation
-    alone would still let a removed email sign back in.
+  secrets), 30-day sessions. No `databaseHooks` gates, no `role` field, no
+  admin plugin, no `ALLOWED_EMAILS`.
 - `src/app/api/auth/[...all]/route.ts`: `GET`/`POST` via Better Auth
   handler (mandatory Route Handler).
 - `src/lib/db.ts`: `MongoClient` singleton (dev HMR-safe global).
-- Data: `user`, `account`, `session`, `verification` (Better Auth-owned);
-  `allowedUsers` (app-owned). Recommended `createdAt` indexes on the four
-  auth collections (routine Atlas performance indexes).
+- Data: `user`, `account`, `session`, `verification` (Better Auth-owned).
+  Recommended `createdAt` indexes on the four auth collections (routine
+  Atlas performance indexes).
 - GitHub private emails: Better Auth's github provider fetches
   `/user/emails` automatically — no extra code.
 
-**Tests.** User hook allows listed + bootstrap (admin role) + plain
-(approved user role); user hook rejects others; session hook rejects
-removed emails even though the user row still exists; `getSession`
-round-trip (mocked providers for unit, real OAuth only in manual M1
-check).
+**Tests.** First sign-in creates a user for any Google/GitHub account;
+repeat sign-in reuses the row; `getSession` round-trip (mocked providers
+for unit, real OAuth only in manual M1 check).
 
 ## F2 — Sessions & auth gating
 
@@ -234,15 +222,13 @@ calls `heartbeatLock`; `beforeunload`/`visibilitychange` call
 **Backend.** `src/actions/lock.ts` (all tiny payloads — actions, not API):
 `acquireLock(boardId)` (CAS: set lock if none/expired; succeed silently
 if holder is already me), `heartbeatLock` (holder-only extends
-`expiresAt`), `releaseLock` (holder only), `forceReleaseLock` (owner, or
-admin **with access to that board** — least-privilege consequence: an
-admin who can't see the board can't touch its lock; separate action for
-audit clarity). Stale-lock purge inside `getBoardMeta` read path.
+`expiresAt`), `releaseLock` (holder only), `forceReleaseLock`
+(owner-only; separate action for audit clarity). Stale-lock purge inside
+`getBoardMeta` read path.
 
 **Tests.** Acquire/contend/expire/heartbeat/release/force-release;
 same-user re-acquire succeeds; non-holder heartbeat rejected; owner
-force-releases stranger lock; admin force-release works only with access;
-non-owner force-release rejected.
+force-releases stranger lock; non-owner force-release rejected.
 
 ## F8 — Read-only when locked by someone else
 
@@ -252,9 +238,8 @@ so I can look without breaking their work.
 
 **Acceptance.** Locked board mounts editor with controlled
 `viewModeEnabled`, non-interactive toolbar; `LockBanner` shows holder +
-Retry (re-checks lock action, then `router.refresh()`); owner (or admin
-with access) sees Force-release; lock freeing + Retry → Edit button
-appears.
+Retry (re-checks lock action, then `router.refresh()`); owner sees
+Force-release; lock freeing + Retry → Edit button appears.
 
 **UI.** `BoardEditor.tsx` read-only branch; `src/components/LockBanner.tsx`
 (holder, Retry, conditional Force-release).
@@ -265,7 +250,7 @@ can't be imported by client components) used by Retry;
 `forceReleaseLock` from F7. No new endpoints.
 
 **Tests.** Read-only prop set when locked; Retry transitions on freed lock;
-force-release restricted to owner/admin.
+force-release restricted to owner.
 
 ## F9 — Autosave while editing
 
@@ -315,10 +300,10 @@ deterministically; retry succeeds after rebase.
 **Story.** As an owner, I want to share a board with named people as viewer
 or editor, change roles, and revoke, so collaboration stays controlled.
 
-**Acceptance.** Email must belong to an allow-listed user (else validation
-error) **and** must have signed in at least once (a `user` row must exist;
-else "X hasn't signed in yet" — access is granted by userId, and there is
-nothing to grant to a stranger); roles viewer/editor; owner cannot revoke
+**Acceptance.** Email must belong to a registered user — i.e. must have
+signed in at least once (a `user` row must exist; else "X hasn't signed in
+yet" — access is granted by userId, and there is nothing to grant to a
+stranger); roles viewer/editor; owner cannot revoke
 self; revoked editor loses edit immediately (next action fails
 `FORBIDDEN`; open editor drops to read-only on next heartbeat/check);
 access list shows current lock holder.
@@ -328,35 +313,19 @@ editor menu): user list with roles, add-by-email + role picker, revoke
 buttons; calls actions; errors inline.
 
 **Backend.** `src/actions/access.ts`: `setAccess(boardId, { email, role })`
-(owner/admin only; resolves email → userId; upserts `access` entry),
-`revokeAccess(boardId, { userId })` (owner/admin; refuses self-revoke).
+(owner only; resolves email → userId; upserts `access` entry),
+`revokeAccess(boardId, { userId })` (owner only; refuses self-revoke).
 Reads reuse `getBoardMeta`.
 
-**Tests.** Grant/change/revoke matrix; non-allow-listed email rejected;
+**Tests.** Grant/change/revoke matrix; never-signed-in email rejected;
 self-revoke refused; revoked user blocked from save + lock acquire.
 
-## F12 — Admin: allow-list management ("invites")
+## F12 — Removed (allow-list admin; open signup has no admin)
 
-**Story.** As the admin, I want to add/remove allowed emails so I control
-exactly who can ever sign in (auto-approve on first sign-in, F1 decision).
-
-**Acceptance.** Admin dashboard section lists emails, add/remove;
-removed email can't sign in again — blocked immediately at the
-session-creation gate (F1), while already-issued sessions expire naturally;
-non-admins never see the section (nor the actions — enforced server-side).
-
-**UI.** Dashboard admin section (rendered iff `role == "admin"` — the
-custom field from F1, read from the session's user):
-add-email input, remove buttons; calls invite actions.
-
-**Backend.** `src/actions/invites.ts`: `listAllowedEmails`,
-`addAllowedEmail`, `removeAllowedEmail` (all assert `role == "admin"`).
-Bootstrap admin comes from the F1 `create.before` hook (email ∈
-`ALLOWED_EMAILS` → `role: "admin"`); exact end-to-end behavior asserted
-in M1.
-
-**Tests.** Admin-only enforcement; add/remove round-trip; removed email
-fails the F1 session hook (immediate) even with a surviving user row.
+> Deleted 2026-09-20 with the invite-only model. Open signup needs no
+> allow-list, no `ALLOWED_EMAILS`, no `admin` role, and no
+> `src/actions/invites.ts`. F-number kept as a tombstone so F13–F15
+> references stay stable.
 
 ## F13 — Error & edge states
 
@@ -450,7 +419,7 @@ public viewer cannot save, lock, or list (handler-level rejections).
 
 | Area | Cases |
 |---|---|
-| Auth hooks (F1/F12) | user hook: listed, bootstrap→admin role, plain→user role, reject; session hook: removed-email blocked despite surviving user row |
+| Auth (F1) | first sign-in creates user for any Google/GitHub account; repeat sign-in reuses row; `getSession` round-trip |
 | Sessions (F2) | expiry redirect + `next`, `requireUser` unauthenticated, sign-out lands on `/signin` |
 | Boards (F3–F5) | list scoping, create docs + default title + rollback, title validation, full ACL matrix × rename/star/duplicate/delete, duplicate copies neither lock nor access, delete-despite-lock |
 | Lock (F7–F8) | acquire/contend/expire/heartbeat/release/force, same-user re-acquire, read-only branch, viewer permanent read-only |

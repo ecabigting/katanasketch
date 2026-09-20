@@ -1,9 +1,10 @@
 # KatanaSketch — Initial Plan
 
-> **Status:** draft for review · **Date:** 2026-09-18 · **Revised:** 2026-09-20 (Netlify + Atlas)
-> **Goal:** a private, invite-only "plus.excalidraw.com of our own" —
-> sign in with Google/GitHub, a workspace of persistent boards, per-user
-> view/edit sharing, and a single-editor lock (no real-time co-editing).
+> **Status:** draft for review · **Date:** 2026-09-18 · **Revised:** 2026-09-20 (Netlify + Atlas; open signup)
+> **Goal:** a private "plus.excalidraw.com of our own" with **open signup** —
+> anyone can sign in with Google/GitHub and start using it: a workspace of
+> persistent boards, per-user view/edit sharing, and a single-editor lock
+> (no real-time co-editing).
 > Deploy via Netlify Git-connected auto-deploys (no custom domain,
 > `*.netlify.app`); data in the existing MongoDB Atlas cluster.
 > Recurring cost: $0.
@@ -17,7 +18,7 @@
 
 Small-group whiteboarding web app ("KatanaSketch"):
 
-1. Sign-in page (Google + GitHub only), invite-only.
+1. Sign-in page (Google + GitHub only), open signup — anyone can register and start using the app.
 2. Sessions that survive restarts.
 3. Dashboard listing boards (create, rename, star, duplicate, delete, search).
 4. Boards persist to the cloud per user; auto-save while editing.
@@ -30,7 +31,7 @@ Small-group whiteboarding web app ("KatanaSketch"):
 - Real-time multiplayer (cursors, live co-editing) — replaced by the lock.
 - Custom domain (deferred; app lives at `*.netlify.app` with built-in
   HTTPS via Netlify Git auto-deploy).
-- Open signup, teams/orgs, billing, AI features, community libraries,
+- Teams/orgs, billing, AI features, community libraries,
   analytics/Sentry, PWA offline shell, patching the Excalidraw editor.
 
 ## 3. Background & established facts
@@ -63,7 +64,7 @@ Small-group whiteboarding web app ("KatanaSketch"):
 | # | Decision |
 |---|---|
 | 1 | Fresh **Next.js App Router** app in this repo (`katanasketch/`). Standalone repo, npm (kept for simplicity). |
-| 2 | Auth: **Better Auth**, Google + GitHub social providers, MongoDB adapter → existing Atlas cluster. |
+| 2 | Auth: **Better Auth**, Google + GitHub social providers with **open signup**, MongoDB adapter → existing Atlas cluster. No allow-list, no admin role. |
 | 3 | Editor: published **`@excalidraw/excalidraw` npm package** (not workspace-linked to the reference repo). |
 | 4 | No WebSockets anywhere. Locking over HTTPS + heartbeats. |
 | 5 | Netlify Git-connected site (auto-build on push, `*.netlify.app`), official Next.js runtime — no `standalone` output, no zip, no Actions deploy step. |
@@ -76,14 +77,14 @@ Browser ──HTTPS──> [ Netlify: CDN + Next.js runtime (Git auto-deploy) ]
                       ├─ pages (server components read Atlas directly):
                       │   `/`, `/board/[id]`, `/signin`
                       ├─ Server Actions (`src/actions/*`): boards CRUD,
-                      │   lock, sharing, invites — called directly, no fetch
+                      │   lock, sharing — called directly, no fetch
                       ├─ Route Handlers (only): `/api/auth/*` (Better Auth),
                       │   `/api/boards/[id]/scene` (large payloads + 409/423),
                       │   `/api/health`
                       └─ mongodb driver ──> [ MongoDB Atlas (existing cluster) ]
                         database "katanasketch" (+ separate dev database):
                           user/session/account/verification (Better Auth)
-                          boards, scenes, allowedUsers
+                          boards, scenes
 OAuth ──> Google / GitHub (two app registrations,
           callbacks …/api/auth/callback/google|github)
 ```
@@ -110,9 +111,8 @@ katanasketch/
         boards/[id]/scene/route.ts    # GET load (re-fetch), PUT save (version CAS)
     actions/
       boards.ts                       # create/rename/star/duplicate/delete + getBoardMetaAction
-      lock.ts                         # acquire/heartbeat/release/forceRelease
+      lock.ts                         # acquire/heartbeat/release/forceRelease (owner-only force)
       access.ts                       # setAccess/revokeAccess
-      invites.ts                      # allow-list management (admin)
     components/
       SignInButtons.tsx
       Dashboard.tsx
@@ -120,7 +120,7 @@ katanasketch/
       AccessDialog.tsx                # share dialog
       LockBanner.tsx
       lib/
-        auth.ts                         # Better Auth config (+ role field, dual invite gates)
+        auth.ts                         # Better Auth config (open signup, no gates)
         db.ts                           # Atlas MongoClient singleton (dev/prod safe)
         session.ts                      # requireUser()/getUser()
         boards.ts                       # board/scene/lock/access data functions + validation
@@ -150,7 +150,7 @@ the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
 | `mongodb` driver | v6 | Atlas `mongodb+srv://` connection string |
 | `pako` | latest 4.x/5.x at scaffold (mature, unchanged API for years) | Scene compression (same lib the editor uses) |
 | `nanoid` | latest 5.x at scaffold (mature, tiny) | Unguessable board IDs + public-link tokens (gatekeeping) |
-| `vitest` + `mongodb-memory-server` | latest v1/v3 at scaffold | Unit + action/handler tests without burning RU |
+| `vitest` + `mongodb-memory-server` | latest v1/v3 at scaffold | Unit + action/handler tests without touching Atlas |
 
 ## 8. Auth design (Better Auth)
 
@@ -162,12 +162,9 @@ the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
 - `socialProviders: { google: {…}, github: {…} }` (built-in providers).
 - `session: { expiresIn: 30 days, updateAge: 1 day }`, cookies default
   (`httpOnly; Secure; SameSite=Lax`).
-- **Invite-only:** `databaseHooks.user.create.before` hook — allow only if
-  `email ∈ allowedUsers` or `email ∈ ALLOWED_EMAILS` bootstrap list, else
-  return `false` (aborts creation; verified supported). Rejected sign-ins
-  redirect to `/signin?error=not-invited`.
-- Bootstrap: `ALLOWED_EMAILS` env (owner). Admin UI on dashboard manages
-  `allowedUsers` (`{ _id: lowercased email, addedBy, createdAt }`).
+- **Open signup:** no `databaseHooks` gates — any Google/GitHub account
+  creates a user on first sign-in and can start using the app immediately.
+  No `role` field, no admin plugin, no `ALLOWED_EMAILS`, no `allowedUsers`.
 - **Recommended indexes** (create once via script or Atlas UI, documented
   in README): `createdAt` on `user`, `account`, `session`, `verification`
   for session cleanup/query performance. These are routine MongoDB
@@ -183,7 +180,6 @@ Better Auth owns `user`, `session`, `account`, `verification`. App owns:
 |---|---|
 | `boards` | `{ _id: nanoid (unguessable URL id, never ObjectId), ownerId, title, createdAt, updatedAt, version, starredBy: [userId], lock?: { userId, userName, acquiredAt, expiresAt }, access: [{ userId, role: "view"\|"edit" }], publicToken?: string \| null }` — `publicToken` null = no public link (F15) |
 | `scenes` | `{ _id: boardId, version, sceneVersion, updatedAt, payload }` — AES-256-GCM blob (key from `SCENE_KEY`) of pako-compressed `{ elements, files, appState: {zoom, scroll} }`. 16 MB guard (MongoDB document limit) → friendly error. |
-| `allowedUsers` | `{ _id: email, addedBy, createdAt }` |
 
 Indexes (normal MongoDB indexes on Atlas): `boards.ownerId`,
 `boards.access.userId`, `boards.publicToken`, plus the §8 `createdAt` set.
@@ -209,20 +205,20 @@ but nothing in this design needs them).
   on the board doc; TTL 8 min; client heartbeat every 60 s;
   `beforeunload`/`visibilitychange` → best-effort release.
 - Open flow: `GET meta` → no active lock + can edit → "Edit" acquires.
-  Locked by another → editor mounts **read-only** (controlled
-  `viewModeEnabled` prop) + `LockBanner` ("Being edited by X") with Retry
-  and (owner, or admin with access) Force-release.
-- Expired locks purge on read — crashed tabs need no admin action.
+   Locked by another → editor mounts **read-only** (controlled
+   `viewModeEnabled` prop) + `LockBanner` ("Being edited by X") with Retry
+   and (owner-only) Force-release.
+- Expired locks purge on read — crashed tabs need no manual action.
 - Residual double-writer window (TTL expiry + unsaved idle tab) is closed
   by version CAS + `reconcileElements` merge on 409.
 
 ## 12. Pages & flows
 
-- **Signed-out (any route)** → `/signin`: provider buttons;
-  `?error=not-invited` explains invite-only.
+- **Signed-out (any route)** → `/signin`: provider buttons; sign up and
+  sign in are the same flow (first OAuth creates the account).
 - **`/` dashboard (server component):** My boards / Shared with me,
   last-edited, lock dot, search; row actions create/rename/star/duplicate/
-  delete; admin allow-list section; empty-state onboarding.
+  delete; empty-state onboarding.
 - **`/board/[id]`:** server component checks session + permission
   (`authorizeBoard` — missing *or* unauthorized both render uniform 404;
   signed-out goes to `/signin`) + lock, then renders `BoardEditor` with
@@ -231,8 +227,9 @@ but nothing in this design needs them).
 - **`/share/[token]`:** no auth; resolves `publicToken` (bad token →
   uniform 404), renders forced read-only editor with no account UI.
   Public viewers never touch locks, saves, or the board list.
-- **Sharing:** `AccessDialog` (dashboard row or editor menu): email must be
-  an allow-listed user; pick viewer/editor; revoke; shows lock holder.
+- **Sharing:** `AccessDialog` (dashboard row or editor menu): email must
+  belong to a registered user (must have signed in at least once — access
+  is granted by userId); pick viewer/editor; revoke; shows lock holder.
 - **Errors:** uniform 404 (missing and no-access alike), scene-too-large,
   sync-failed banner with retry, expired session → re-sign-in preserving
   the board URL.
@@ -269,7 +266,7 @@ but nothing in this design needs them).
    `NEXT_PUBLIC_*`): `BETTER_AUTH_SECRET`,
    `BETTER_AUTH_URL=https://<site>.netlify.app`, `GOOGLE_*`,
    `GITHUB_*`, `MONGODB_URI` (Atlas `mongodb+srv://…`), `MONGODB_DB`
-   (e.g. `katanasketch`), `SCENE_KEY`, `ALLOWED_EMAILS`, plus
+   (e.g. `katanasketch`), `SCENE_KEY`, plus
    `NEXT_TELEMETRY_DISABLED=1`. Preview deploys share the dev database
    or a scratch database — never prod.
 5. HTTPS is built-in on `*.netlify.app`. No `PORT` handling, no
@@ -292,7 +289,7 @@ Pre-deployment check: `npm run build` passes locally before pushing
 
 ## 16. Testing & verification
 
-- **Vitest:** allow-list hooks, role assignment, ACL matrix per action,
+- **Vitest:** ACL matrix per action,
   lock acquire/contend/expire/heartbeat/force-release (+ same-user
   re-acquire), scene CAS 409 + merge path, 16 MB guard, session issuance
   with mocked providers. Full matrix in `docs/specs.md`.
@@ -304,12 +301,12 @@ Pre-deployment check: `npm run build` passes locally before pushing
 ## 17. Milestones & exit criteria
 
 - **M1 — Webapp + auth + deploy:** Next scaffold, Better Auth (Google+
-  GitHub) vs Atlas dev database, allow-list hook + sign-in page, empty dashboard,
+  GitHub, open signup) vs Atlas dev database, sign-in page, empty dashboard,
   Netlify Git auto-deploy, health check. **Exit:** sign in on the
   live URL; dashboard loads; sessions survive restarts. *(Proves the two
   riskiest integrations first.)*
 - **M2 — Boards actions + scene endpoints + dashboard:** CRUD/duplicate/
-  star/search via Server Actions, scene GET/PUT handlers, invites admin UI,
+  star/search via Server Actions, scene GET/PUT handlers,
   indexes, action tests green.
 - **M3 — Editor + save/load + lock:** `BoardEditor`, scene endpoints, lock
   flow + read-only + banner, autosave + offline queue + conflict merge,
@@ -323,7 +320,7 @@ Pre-deployment check: `npm run build` passes locally before pushing
 | Risk | Mitigation |
 |---|---|
 | Better Auth↔Atlas quirks | M1 proves it against the Atlas dev database; adapter `debugLogs`; fallback: hand-rolled session table (§9 already shaped for it) |
-| Rejected-OAuth UX differs by Better Auth version | M1 spike asserts the `?error=not-invited` path end-to-end |
+| Open-signup abuse (spam accounts) | Out of scope for this group-sized app; sharing requires a registered user; rate limits on scene/token endpoints; revisit CAPTCHA/rate limits only if abused |
 | Netlify function cold start / execution limits | Small group; accept occasional cold start; autosave debounce + retry covers transient slowness |
 | Lock TTL race → conflicting saves | Version CAS + reconcile merge; 8-min TTL + 60-s heartbeat |
 | Scene + images > 16 MB (MongoDB doc limit) | Client estimate + server guard + clear error; editor downscales pasted images |
@@ -337,7 +334,7 @@ Pre-deployment check: `npm run build` passes locally before pushing
 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
 `GITHUB_CLIENT_SECRET`, `MONGODB_URI` (Atlas `mongodb+srv://…`),
 `MONGODB_DB` (`katanasketch`, dev uses a separate name), `SCENE_KEY`
-(32-byte, generated), `ALLOWED_EMAILS`.
+(32-byte, generated).
 No `VITE_APP_*` anywhere.
 
 ## 20. Verification log (line-by-line check, 2026-09-18)
@@ -444,3 +441,13 @@ runtime (no `standalone`, no zip, no Actions deploy).
    `https://<site>.netlify.app/api/auth/callback/...` plus localhost dev
    counterparts; `BETTER_AUTH_URL` set in the Netlify UI per environment.
    **In plan (§14.6–§14.7).**
+
+## 22. Revision log — open signup (2026-09-20)
+
+Invite-only removed. Anyone with Google/GitHub can register and start using
+the app; there is no allow-list, no `ALLOWED_EMAILS`, no `admin` role, and
+no `allowedUsers` collection. Board sharing resolves any registered user
+(must have signed in at least once — access is granted by userId).
+`forceReleaseLock` is owner-only (the former admin-with-access path is
+gone with the role). F12 (allow-list admin) is removed in specs/features;
+F-numbers are otherwise unchanged.
