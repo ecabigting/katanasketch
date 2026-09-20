@@ -78,7 +78,8 @@ workspace immediately — no invite needed.
 
 **Tests.** First sign-in creates a user for any Google/GitHub account;
 repeat sign-in reuses the row; `getSession` round-trip (mocked providers
-for unit, real OAuth only in manual M1 check).
+for unit, real OAuth only in manual M1 check); sign-in triggers
+`claimInvitesForEmail` (F11) exactly once per session creation.
 
 ## F2 — Sessions & auth gating
 
@@ -295,30 +296,51 @@ second failure).
 **Tests.** reconcile unit: local + remote element sets merge
 deterministically; retry succeeds after rebase.
 
-## F11 — Sharing: grant / change / revoke view & edit
+## F11 — Sharing: invite by email / claim on sign-in / revoke
 
-**Story.** As an owner, I want to share a board with named people as viewer
-or editor, change roles, and revoke, so collaboration stays controlled.
+**Story.** As an owner, I want to invite anyone by email as viewer or
+editor, change roles, and revoke — without searching users — so that the
+invited person gets access automatically once they register and sign in.
 
-**Acceptance.** Email must belong to a registered user — i.e. must have
-signed in at least once (a `user` row must exist; else "X hasn't signed in
-yet" — access is granted by userId, and there is nothing to grant to a
-stranger); roles viewer/editor; owner cannot revoke
-self; revoked editor loses edit immediately (next action fails
-`FORBIDDEN`; open editor drops to read-only on next heartbeat/check);
-access list shows current lock holder.
+**Acceptance.**
+- Owner enters any email + role (viewer/editor) → a `boardInvites` record
+  (`boardId + lowercased email + role`) is upserted. No user lookup happens;
+  the response never reveals whether the email is registered (no
+  enumeration oracle for either state).
+- When that email registers and signs in, the claim step converts matching
+  invites into `boards.access` entries and deletes them; the board then
+  appears under Shared with me. Already-registered invitees get access via
+  the same claim path (at sign-in + lazily on dashboard load via
+  `ensureInvitesClaimed`) — never via a user-search endpoint.
+- Pending invites confer no access until claimed; the dialog shows members
+  + pending invites (owner only) plus the current lock holder.
+- Owner cannot revoke self; revoked editor loses edit immediately (next
+  action fails `FORBIDDEN`; open editor drops to read-only on next
+  heartbeat/check).
 
 **UI.** `src/components/AccessDialog.tsx` (opened from dashboard row or
-editor menu): user list with roles, add-by-email + role picker, revoke
-buttons; calls actions; errors inline.
+editor menu): members list with roles, pending-invites list (email + role),
+add-by-email + role picker, revoke buttons covering both lists; calls
+actions; errors inline. No user search field anywhere.
 
-**Backend.** `src/actions/access.ts`: `setAccess(boardId, { email, role })`
-(owner only; resolves email → userId; upserts `access` entry),
-`revokeAccess(boardId, { userId })` (owner only; refuses self-revoke).
-Reads reuse `getBoardMeta`.
+**Backend.** `src/actions/access.ts` (owner only):
+`inviteEmail(boardId, { email, role })` (validates email format, lowercases,
+upserts `boardInvites`; never reads the `user` collection),
+`revokeInvite(boardId, { email })` (deletes pending invite),
+`setAccess(boardId, { userId, role })` / `revokeAccess(boardId, { userId })`
+for already-granted entries (refuses self-revoke).
+`src/lib/invites.ts`: `claimInvitesForEmail(email, userId)` — converts
+matching invites to `access` entries (idempotent upsert) and deletes them;
+called at session creation and lazily on dashboard load. Reads reuse
+`getBoardMeta`; `authorizeBoard` only honors granted `access`, never pending.
 
-**Tests.** Grant/change/revoke matrix; never-signed-in email rejected;
-self-revoke refused; revoked user blocked from save + lock acquire.
+**Tests.** Invite stores record for unknown email with generic success (same
+response as known email — no oracle); claim on sign-in grants access and
+deletes the invite; lazy claim on dashboard load grants without re-login;
+pending invite alone grants nothing (save + lock + open all still 404);
+role change on pending invite updates the record; revoke of pending invite
+prevents later claim; self-revoke refused; revoked user blocked from save +
+lock acquire.
 
 ## F12 — Removed (allow-list admin; open signup has no admin)
 
@@ -424,7 +446,7 @@ public viewer cannot save, lock, or list (handler-level rejections).
 | Boards (F3–F5) | list scoping, create docs + default title + rollback, title validation, full ACL matrix × rename/star/duplicate/delete, duplicate copies neither lock nor access, delete-despite-lock |
 | Lock (F7–F8) | acquire/contend/expire/heartbeat/release/force, same-user re-acquire, read-only branch, viewer permanent read-only |
 | Scene (F9–F10) | version CAS, `updatedAt` bump, 409 + merge, size guard, holder-only writes |
-| Sharing (F11) | grant/change/revoke, never-signed-in email rejected, self-revoke refusal, post-revoke blocking |
+| Sharing (F11) | invite-by-email stored without user lookup (no oracle), claim on sign-in + lazy dashboard claim, pending grants nothing, change/revoke incl. pending, self-revoke refusal, post-revoke blocking |
 | Public link (F15) | enable/disable/regenerate lifecycle, old/bad token 404, no edit/save/lock/list for public viewers |
 
 `mongodb-memory-server` for all DB tests; one smoke job against the Atlas

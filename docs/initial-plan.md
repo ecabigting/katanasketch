@@ -84,7 +84,7 @@ Browser ──HTTPS──> [ Netlify: CDN + Next.js runtime (Git auto-deploy) ]
                       └─ mongodb driver ──> [ MongoDB Atlas (existing cluster) ]
                         database "katanasketch" (+ separate dev database):
                           user/session/account/verification (Better Auth)
-                          boards, scenes
+                          boards, scenes, boardInvites
 OAuth ──> Google / GitHub (two app registrations,
           callbacks …/api/auth/callback/google|github)
 ```
@@ -112,7 +112,7 @@ katanasketch/
     actions/
       boards.ts                       # create/rename/star/duplicate/delete + getBoardMetaAction
       lock.ts                         # acquire/heartbeat/release/forceRelease (owner-only force)
-      access.ts                       # setAccess/revokeAccess
+      access.ts                       # invite-by-email, claim-on-signin, revoke (no user search)
     components/
       SignInButtons.tsx
       Dashboard.tsx
@@ -165,6 +165,11 @@ the lockfile at scaffold (lockfile committed); CVEs re-checked at scaffold.
 - **Open signup:** no `databaseHooks` gates — any Google/GitHub account
   creates a user on first sign-in and can start using the app immediately.
   No `role` field, no admin plugin, no `ALLOWED_EMAILS`, no `allowedUsers`.
+- **Invite claim:** a post-sign-in step (session creation + lazy
+  `ensureInvitesClaimed` on dashboard load) resolves pending `boardInvites`
+  for the sign-in email into `boards.access` entries, then deletes the
+  claimed invites. There is deliberately **no user directory or user-search
+  endpoint** — sharing never looks users up.
 - **Recommended indexes** (create once via script or Atlas UI, documented
   in README): `createdAt` on `user`, `account`, `session`, `verification`
   for session cleanup/query performance. These are routine MongoDB
@@ -180,9 +185,11 @@ Better Auth owns `user`, `session`, `account`, `verification`. App owns:
 |---|---|
 | `boards` | `{ _id: nanoid (unguessable URL id, never ObjectId), ownerId, title, createdAt, updatedAt, version, starredBy: [userId], lock?: { userId, userName, acquiredAt, expiresAt }, access: [{ userId, role: "view"\|"edit" }], publicToken?: string \| null }` — `publicToken` null = no public link (F15) |
 | `scenes` | `{ _id: boardId, version, sceneVersion, updatedAt, payload }` — AES-256-GCM blob (key from `SCENE_KEY`) of pako-compressed `{ elements, files, appState: {zoom, scroll} }`. 16 MB guard (MongoDB document limit) → friendly error. |
+| `boardInvites` | `{ _id, boardId, email (lowercased), role: "view"\|"edit", invitedBy, createdAt }` — pending invite-by-email; **not** a user lookup. Claimed into `boards.access` on the invitee's sign-in, then deleted. |
 
 Indexes (normal MongoDB indexes on Atlas): `boards.ownerId`,
-`boards.access.userId`, `boards.publicToken`, plus the §8 `createdAt` set.
+`boards.access.userId`, `boards.publicToken`, unique `(boardInvites.boardId,
+boardInvites.email)`, plus the §8 `createdAt` set.
 Compound/text indexes are available if ever needed; the current queries
 don't require them.
 
@@ -227,9 +234,13 @@ but nothing in this design needs them).
 - **`/share/[token]`:** no auth; resolves `publicToken` (bad token →
   uniform 404), renders forced read-only editor with no account UI.
   Public viewers never touch locks, saves, or the board list.
-- **Sharing:** `AccessDialog` (dashboard row or editor menu): email must
-  belong to a registered user (must have signed in at least once — access
-  is granted by userId); pick viewer/editor; revoke; shows lock holder.
+- **Sharing (invite-by-email, no user search):** `AccessDialog` (dashboard
+  row or editor menu): owner enters any email + viewer/editor role → stored
+  as a `boardInvites` record. No user lookup happens: the response never
+  reveals whether the email is registered. When that email registers and
+  signs in, the claim step converts the invite into `boards.access` and the
+  board appears under Shared with me. Dialog shows members + pending invites;
+  revoke covers both; shows lock holder.
 - **Errors:** uniform 404 (missing and no-access alike), scene-too-large,
   sync-failed banner with retry, expired session → re-sign-in preserving
   the board URL.
@@ -320,7 +331,7 @@ Pre-deployment check: `npm run build` passes locally before pushing
 | Risk | Mitigation |
 |---|---|
 | Better Auth↔Atlas quirks | M1 proves it against the Atlas dev database; adapter `debugLogs`; fallback: hand-rolled session table (§9 already shaped for it) |
-| Open-signup abuse (spam accounts) | Out of scope for this group-sized app; sharing requires a registered user; rate limits on scene/token endpoints; revisit CAPTCHA/rate limits only if abused |
+| Open-signup abuse (spam accounts) | Out of scope for this group-sized app; invites are email records claimed on registration (no user search); rate limits on scene/invite/token endpoints; revisit CAPTCHA/rate limits only if abused |
 | Netlify function cold start / execution limits | Small group; accept occasional cold start; autosave debounce + retry covers transient slowness |
 | Lock TTL race → conflicting saves | Version CAS + reconcile merge; 8-min TTL + 60-s heartbeat |
 | Scene + images > 16 MB (MongoDB doc limit) | Client estimate + server guard + clear error; editor downscales pasted images |
@@ -446,8 +457,20 @@ runtime (no `standalone`, no zip, no Actions deploy).
 
 Invite-only removed. Anyone with Google/GitHub can register and start using
 the app; there is no allow-list, no `ALLOWED_EMAILS`, no `admin` role, and
-no `allowedUsers` collection. Board sharing resolves any registered user
-(must have signed in at least once — access is granted by userId).
+no `allowedUsers` collection. Board sharing is invite-by-email (see §23 —
+no user search; access granted when the invited email registers/signs in).
 `forceReleaseLock` is owner-only (the former admin-with-access path is
 gone with the role). F12 (allow-list admin) is removed in specs/features;
 F-numbers are otherwise unchanged.
+
+## 23. Revision log — invite-by-email sharing (2026-09-20)
+
+No user search or user directory anywhere. Owners invite by email; the
+invite is stored as a `boardInvites` record (`boardId + email + role`) and
+the response never reveals whether that email is registered (no
+enumeration oracle). Claim: on the invitee's sign-in (session creation)
+and lazily via `ensureInvitesClaimed` on dashboard load, matching invites
+are converted into `boards.access` entries and deleted. Pending invites are
+visible only to the board owner in `AccessDialog` (members + pending) and
+confer no access until claimed. Revoke covers both granted access and
+pending invites.

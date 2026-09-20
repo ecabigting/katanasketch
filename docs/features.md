@@ -480,48 +480,88 @@ try.
 
 ---
 
-## F11 — Sharing: grant / change / revoke view & edit
+## F11 — Sharing: invite by email / claim on sign-in / revoke
 
-**Overview.** Owners share boards with named people as viewers or editors,
-change roles, and revoke. Sharing only works for people who have signed in
-at least once.
+**Overview.** Owners invite anyone by email as viewer or editor — no user
+search. The invite is recorded, and the person gets access automatically
+once they register and sign in. Roles can be changed and invites/access
+revoked.
 
 **Priority:** Must · **Milestone:** M4
 
-### F11.1 — Grant viewer or editor access
+### F11.1 — Invite anyone by email (no user search)
 
-- *Story.* As an owner, I want to share a board with a named person as
-  viewer or editor so that collaboration stays controlled.
-- *Acceptance.* Email must belong to a registered user — must have signed
-  in at least once (a `user` row must exist, else "X hasn't signed in yet"
-  — access is granted by userId, and there is nothing to grant to a stranger).
-- *UI (builders).* `AccessDialog.tsx` (dashboard row or editor menu): user
-  list with roles, add-by-email + role picker, errors inline.
-- *Backend (builders).* `actions/access.ts setAccess(boardId, { email, role })`
-  (owner only; resolves email → userId; upserts `access` entry).
-- *Edge cases.* Case-variant emails resolve to the same user; granting the
-  owner's own email is a no-op; granting while the board is locked doesn't
-  disturb the lock.
-- *Tests.* Grant matrix per role; never-signed-in email rejected; stranger
-  granter rejected.
+- *Story.* As an owner, I want to invite anyone by email as viewer or editor
+  so that they can collaborate without me searching for users.
+- *Acceptance.*
+  - Owner enters any email + role → invite recorded (`boardInvites`
+    keyed by lowercased email); the response is identical whether or not
+    the email is registered — it never reveals registration status.
+  - No user search field or user directory exists anywhere in the UI or API.
+  - Pending invites confer no access until claimed (F11.2); the dialog shows
+    members + pending invites (owner only).
+- *UI (builders).* `AccessDialog.tsx` (dashboard row or editor menu):
+  members list, pending-invites list (email + role), add-by-email + role
+  picker, errors inline. No search/autocomplete component.
+- *Backend (builders).* `actions/access.ts inviteEmail(boardId, { email,
+  role })` (owner only; validates format, lowercases, upserts `boardInvites`;
+  never reads the `user` collection).
+- *Edge cases.* Case-variant emails collapse to one record; inviting the
+  owner's own email is a no-op with the same generic success; inviting while
+  the board is locked doesn't disturb the lock; duplicate invite upserts the
+  role instead of duplicating.
+- *Tests.* Invite stores a record for an unknown email with generic success;
+  same response for a known email (no oracle); malformed email rejected
+  `VALIDATION`; stranger inviter rejected.
 
-### F11.2 — Change roles and revoke access
+### F11.2 — Invited email registers and gains access
 
-- *Story.* As an owner, I want to change roles and revoke so that ex-editors
-  lose edit immediately and I can't lock myself out.
-- *Acceptance.* Role change viewer↔editor takes effect on next action;
-  revoked editor's next save/lock fails `FORBIDDEN` and open editors drop to
-  read-only on next heartbeat/check; owner cannot revoke self; access list
-  shows the current lock holder.
-- *UI (builders).* Same dialog: role picker per row, revoke buttons;
-  lock-holder row.
-- *Backend (builders).* `setAccess` upsert for changes; `revokeAccess(boardId,
-  { userId })` (refuses self-revoke); reads reuse `getBoardMeta`.
+- *Story.* As an invited person, I want the board to appear in my workspace
+  once I register and sign in, so that the invite just works.
+- *Acceptance.*
+  - On sign-in (session creation) the claim step converts all matching
+    `boardInvites` for my email into `boards.access` entries and deletes
+    them; the board appears under Shared with me.
+  - Already-registered invitees get access through the same claim path
+    without re-login: dashboard load runs lazy `ensureInvitesClaimed`.
+  - A pending invite alone grants nothing — opening the board URL before
+    claiming still yields uniform 404; saves/locks are rejected.
+- *UI (builders).* No invite UI on the invitee side; the board simply
+  appears in `Dashboard.tsx` Shared with me after claim.
+- *Backend (builders).* `lib/invites.ts claimInvitesForEmail(email, userId)`
+  (idempotent: upsert `access`, delete claimed invites); called at session
+  creation and on dashboard load. `authorizeBoard` honors granted `access`
+  only, never pending rows.
+- *Edge cases.* Invite accepted while the board is locked → invitee lands in
+  the F8 read-only flow; board deleted before claim → invite rows cleaned
+  with the board; concurrent sign-ins claim idempotently (no duplicate
+  `access` entries).
+- *Tests.* Claim on sign-in grants access and deletes the invite; lazy claim
+  on dashboard load grants without re-login; pending-only invitee gets 404
+  on open/save/lock; double claim is idempotent.
+
+### F11.3 — Change roles and revoke access (members + pending)
+
+- *Story.* As an owner, I want to change roles and revoke — for members and
+  pending invites alike — so that ex-editors lose edit immediately and I
+  can't lock myself out.
+- *Acceptance.* Role change viewer↔editor (member or pending record) takes
+  effect on next action/claim; revoked editor's next save/lock fails
+  `FORBIDDEN` and open editors drop to read-only on next heartbeat/check;
+  revoking a pending invite prevents any later claim; owner cannot revoke
+  self; access list shows the current lock holder.
+- *UI (builders).* Same dialog: role picker per row across both lists,
+  revoke buttons for both; lock-holder row.
+- *Backend (builders).* `setAccess` upsert for member changes;
+  `revokeAccess(boardId, { userId })` (refuses self-revoke);
+  `revokeInvite(boardId, { email })` for pending rows; reads reuse
+  `getBoardMeta`.
 - *Edge cases.* Revoking the current lock holder doesn't clear the lock row
   (it purges on read/expiry; their writes already fail); revoking the last
-  editor is allowed (owner remains).
-- *Tests.* Change/revoke matrix; self-revoke refused; post-revoke save + lock
-  blocked.
+  editor is allowed (owner remains); role changed while invite pending
+  applies at claim time.
+- *Tests.* Change/revoke matrix across members and pending; revoked pending
+  never claims; self-revoke refused; post-revoke save + lock blocked.
 
 ---
 
@@ -658,10 +698,14 @@ just aspirational.
   private.
 - *Acceptance.*
   - Board ids and public tokens are `nanoid` 21+ chars; missing ≡ forbidden
-    (uniform 404) everywhere including `/share/*`.
+    (uniform 404) everywhere including `/share/*`; pending invites are
+    invisible outside the owner's dialog and grant nothing until claimed.
   - Every page/action/handler calls `authorizeBoard` first; there is no
     admin role and no privilege escalation path — `forceReleaseLock` is
     owner-only.
+  - No user search or user directory exists; inviting any email returns the
+    same generic success whether or not the address is registered (no
+    enumeration oracle).
   - Scenes stored AES-256-GCM (`SCENE_KEY` 32-byte); tampered payload fails
     closed; secrets server-side only (no `NEXT_PUBLIC_*`).
   - Public pages expose no user data, no board list, no save/lock paths.
@@ -723,7 +767,7 @@ just aspirational.
 | F8 read-only when locked | Must | M3 | F8.1 |
 | F9 autosave | Must | M3 | F9.1 |
 | F10 conflict merge | Should | M3 | F10.1 |
-| F11 sharing | Must | M4 | F11.1–F11.2 |
+| F11 sharing | Must | M4 | F11.1–F11.3 |
 | F12 (removed — allow-list admin) | — | — | tombstone, no stories |
 | F13 errors & edges | Must | M3→M4 | F13.1–F13.2 |
 | F14 deploy & health | Must | M1→all | ops checklist |
